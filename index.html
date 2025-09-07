@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>勤怠ミニ（Supabase・写真必須）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif; margin: 24px; }
+    h1 { margin-bottom: 8px; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin: 12px 0; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    input, button { padding: 8px; font-size: 14px; }
+    button { cursor: pointer; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
+    th { background: #f7f7f7; }
+    img.thumb { width: 80px; height: 80px; object-fit: cover; border: 1px solid #ccc; border-radius: 4px; }
+    .muted { color: #666; font-size: 12px; }
+    .right { text-align: right; }
+  </style>
+</head>
+<body>
+  <h1>勤怠ミニ（写真必須）</h1>
+  <div class="muted">※ Supabase + Storage。打刻写真は必須、履歴はJST表示。</div>
+
+  <!-- 認証 -->
+  <div id="auth" class="card">
+    <div class="row">
+      <input id="email" type="email" placeholder="メールアドレス" />
+      <input id="password" type="password" placeholder="パスワード" />
+      <button id="signup">新規登録</button>
+      <button id="login">ログイン</button>
+      <button id="logout" style="display:none">ログアウト</button>
+    </div>
+  </div>
+
+  <!-- アプリ本体 -->
+  <div id="app" class="card" style="display:none">
+    <div class="row">
+      <div id="user" class="muted">ログイン情報取得中…</div>
+    </div>
+
+    <h3>打刻</h3>
+    <div class="row">
+      <label>出勤写真（背面カメラ推奨）:</label>
+      <input id="photoIn" type="file" accept="image/*" capture="environment" />
+      <button id="clockIn">出勤</button>
+    </div>
+    <div class="row">
+      <label>退勤写真（背面カメラ推奨）:</label>
+      <input id="photoOut" type="file" accept="image/*" capture="environment" />
+      <button id="clockOut">退勤</button>
+    </div>
+    <div class="row">
+      <input id="notes" placeholder="メモ（任意）" style="flex:1; min-width: 240px;" />
+      <button id="refresh" title="履歴を更新">履歴更新</button>
+    </div>
+
+    <h3>履歴（JST）</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>出勤時刻</th>
+          <th>退勤時刻</th>
+          <th>出勤写真</th>
+          <th>退勤写真</th>
+          <th>メモ</th>
+        </tr>
+      </thead>
+      <tbody id="history"></tbody>
+    </table>
+    <div class="muted right" id="count"></div>
+  </div>
+
+  <script type="module">
+    import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+    // ★ここを置き換え
+    const supabaseUrl = "https://rrovjxpctekdjpgqylh.supabase.co";
+    const supabaseKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJyb3ZqeHBqY3Rla2RqcGdxeWxoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTcyNDE0NzAsImV4cCI6MjA3MjgxNzQ3MH0.8ukaDktr4p8mw20KWoXb3-NfcJOIIDWLV7D4jSf_jE8";
+    const supabase = createClient(supabaseUrl, supabaseKey);
+
+    // 定数
+    const bucket = 'kintai-photos';
+
+    // DOM
+    const authDiv = document.getElementById('auth');
+    const appDiv = document.getElementById('app');
+    const userP = document.getElementById('user');
+
+    const email = document.getElementById('email');
+    const password = document.getElementById('password');
+    const btnSignup = document.getElementById('signup');
+    const btnLogin = document.getElementById('login');
+    const btnLogout = document.getElementById('logout');
+
+    const btnIn = document.getElementById('clockIn');
+    const btnOut = document.getElementById('clockOut');
+    const btnRefresh = document.getElementById('refresh');
+    const notes = document.getElementById('notes');
+
+    const photoIn = document.getElementById('photoIn');
+    const photoOut = document.getElementById('photoOut');
+    const historyTbody = document.getElementById('history');
+    const countDiv = document.getElementById('count');
+
+    // Utils
+    const toJST = (iso) => iso ? new Date(iso).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }) : "";
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+    // 画像圧縮：長辺1280px, JPEG 0.85
+    async function compressImage(file) {
+      const bmp = await createImageBitmap(file);
+      const maxSide = 1280;
+      const scale = Math.min(1, maxSide / Math.max(bmp.width, bmp.height));
+      const w = Math.round(bmp.width * scale);
+      const h = Math.round(bmp.height * scale);
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(bmp, 0, 0, w, h);
+      const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.85));
+      return new File([blob], file.name.replace(/\.\w+$/, '') + '.jpg', { type: 'image/jpeg' });
+    }
+
+    async function uploadPhoto(file, kind /* 'in' | 'out' */) {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) throw new Error('ログインしてください');
+
+      const compact = await compressImage(file);
+
+      // パス: userId/YYYY/MM/DD/clockin_*.jpg
+      const now = new Date(); // UTCベース
+      const yyyy = now.getUTCFullYear();
+      const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+      const dd = String(now.getUTCDate()).padStart(2, '0');
+      const ts = now.getTime();
+      const path = `${user.id}/${yyyy}/${mm}/${dd}/clock${kind}_${ts}.jpg`;
+
+      const { error } = await supabase.storage.from(bucket).upload(path, compact, {
+        upsert: false,
+        contentType: 'image/jpeg',
+      });
+      if (error) throw error;
+      return path;
+    }
+
+    async function signedUrl(path) {
+      if (!path) return null;
+      const { data, error } = await supabase.storage.from(bucket).createSignedUrl(path, 60 * 10);
+      if (error) return null;
+      return data.signedUrl;
+    }
+
+    async function ensureProfile(user) {
+      const { data, error } = await supabase
+        .from('profiles').select('id').eq('id', user.id).maybeSingle();
+      if (!data) {
+        await supabase.from('profiles').insert({ id: user.id, display_name: user.email });
+      }
+    }
+
+    async function findOpenEntry() {
+      const { data, error } = await supabase
+        .from('time_entries')
+        .select('*')
+        .is('clock_out', null)
+        .order('clock_in', { ascending: false })
+        .limit(1);
+      if (error) throw error;
+      return data?.[0] ?? null;
+    }
+
+    async function refreshUI() {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (user) {
+        await ensureProfile(user);
+        authDiv.style.display = 'none';
+        appDiv.style.display = 'block';
+        btnLogout.style.display = 'inline-block';
+        userP.textContent = `ログイン中：${user.email}`;
+
+        // 履歴取得
+        const { data: rows, error } = await supabase
+          .from('time_entries')
+          .select('*')
+          .order('clock_in', { ascending: false })
+          .limit(100);
+        if (error) { alert(error.message); return; }
+
+        historyTbody.innerHTML = '';
+        countDiv.textContent = `${rows?.length ?? 0} 件`;
+
+        for (const r of (rows || [])) {
+          const tr = document.createElement('tr');
+
+          const inUrl = await signedUrl(r.clock_in_photo);
+          const outUrl = await signedUrl(r.clock_out_photo);
+
+          tr.innerHTML = `
+            <td>${toJST(r.clock_in)}</td>
+            <td>${toJST(r.clock_out) || ''}</td>
+            <td>${inUrl ? `<a href="${inUrl}" target="_blank" rel="noopener"><img class="thumb" src="${inUrl}" alt="in"></a>` : ''}</td>
+            <td>${outUrl ? `<a href="${outUrl}" target="_blank" rel="noopener"><img class="thumb" src="${outUrl}" alt="out"></a>` : ''}</td>
+            <td>${(r.notes ?? '').replace(/[<>&]/g, s => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[s]))}</td>
+          `;
+          historyTbody.appendChild(tr);
+        }
+      } else {
+        authDiv.style.display = 'block';
+        appDiv.style.display = 'none';
+        btnLogout.style.display = 'none';
+      }
+    }
+
+    // 認証ハンドラ
+    btnSignup.onclick = async () => {
+      const { error } = await supabase.auth.signUp({
+        email: email.value, password: password.value
+      });
+      if (error) alert(error.message); else alert('確認メールをチェックしてください');
+    };
+    btnLogin.onclick = async () => {
+      const { error } = await supabase.auth.signInWithPassword({
+        email: email.value, password: password.value
+      });
+      if (error) alert(error.message);
+      await refreshUI();
+    };
+    btnLogout.onclick = async () => {
+      await supabase.auth.signOut();
+      await refreshUI();
+    };
+
+    // 出勤（写真必須）
+    btnIn.onclick = async () => {
+      const file = photoIn.files?.[0];
+      if (!file) { alert('出勤の写真を添付してください'); return; }
+
+      try {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) return;
+
+        const photoPath = await uploadPhoto(file, 'in');
+        const now = new Date(); // UTC保存
+
+        const { error } = await supabase.from('time_entries').insert({
+          user_id: user.id,
+          clock_in: now.toISOString(),
+          clock_in_photo: photoPath,
+          notes: notes.value || null,
+        });
+        if (error) throw error;
+
+        photoIn.value = '';
+        notes.value = '';
+        await refreshUI();
+      } catch (e) {
+        alert('出勤打刻に失敗しました：' + e.message);
+      }
+    };
+
+    // 退勤（写真必須）
+    btnOut.onclick = async () => {
+      const file = photoOut.files?.[0];
+      if (!file) { alert('退勤の写真を添付してください'); return; }
+
+      try {
+        // 夜間バッチ系の古シス回避のため、開いてからすぐ更新しない方が安定する場合あり
+        const open = await findOpenEntry();
+        if (!open) { alert('未退勤の打刻が見つかりません'); return; }
+
+        const photoPath = await uploadPhoto(file, 'out');
+        const now = new Date();
+
+        // 念のため少し待機（Storage整合 & 署名URL生成安定用）
+        await sleep(200);
+
+        const { error } = await supabase
+          .from('time_entries')
+          .update({
+            clock_out: now.toISOString(),
+            clock_out_photo: photoPath,
+            notes: notes.value || open.notes,
+          })
+          .eq('id', open.id);
+        if (error) throw error;
+
+        photoOut.value = '';
+        notes.value = '';
+        await refreshUI();
+      } catch (e) {
+        alert('退勤打刻に失敗しました：' + e.message);
+      }
+    };
+
+    btnRefresh.onclick = refreshUI;
+    supabase.auth.onAuthStateChange(refreshUI);
+    refreshUI();
+  </script>
+</body>
+</html>
